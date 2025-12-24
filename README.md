@@ -26,7 +26,7 @@ From zero to RAG in 5 minutes. QuickRAG provides a batteries-included framework 
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/yourusername/QuickRAG
+git clone https://github.com/T-K-O-H/QuickRAG
 cd QuickRAG
 
 # Install Python package
