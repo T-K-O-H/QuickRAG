@@ -5,11 +5,14 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 
-from api.dependencies import get_pipeline
+from api.auth import verify_api_key
+from api.dependencies import get_pipeline, get_pipeline_for_collection
+from quickrag.logging import get_logger
 
+logger = get_logger(__name__)
 
 router = APIRouter()
 
@@ -28,6 +31,7 @@ class IngestURLRequest(BaseModel):
 
     url: str
     metadata: dict | None = None
+    collection: str | None = None
 
 
 def generate_document_metadata(
@@ -55,14 +59,17 @@ def generate_document_metadata(
 async def ingest_file(
     file: UploadFile = File(...),
     metadata: str | None = Form(None),
+    collection: str | None = Form(None),
+    _key: str | None = Depends(verify_api_key),
 ):
     """Ingest a single file.
 
-    Supports: PDF, TXT, MD, and other text files.
+    Supports: PDF, TXT, MD, CSV, JSON, JSONL, DOCX, and other text files.
     """
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(collection) if collection else get_pipeline()
+    )
 
-    # Parse extra metadata if provided
     extra_meta = {}
     if metadata:
         import json
@@ -71,7 +78,6 @@ async def ingest_file(
         except json.JSONDecodeError:
             pass
 
-    # Save uploaded file temporarily
     suffix = Path(file.filename or "document").suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -79,7 +85,6 @@ async def ingest_file(
         tmp_path = tmp.name
 
     try:
-        # Generate document metadata
         meta = generate_document_metadata(
             source_type="file",
             source=file.filename or "uploaded_file",
@@ -87,9 +92,9 @@ async def ingest_file(
             extra=extra_meta,
         )
 
-        # Ingest the file
         chunks = pipeline.ingest(tmp_path, metadata=meta)
 
+        logger.info("Ingested file %s: %d chunks", file.filename, chunks)
         return IngestResponse(
             success=True,
             chunks_indexed=chunks,
@@ -97,9 +102,9 @@ async def ingest_file(
             document_id=meta["document_id"],
         )
     except Exception as e:
+        logger.error("Failed to ingest file %s: %s", file.filename, e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Clean up temp file
         Path(tmp_path).unlink(missing_ok=True)
 
 
@@ -107,14 +112,17 @@ async def ingest_file(
 async def ingest_files(
     files: list[UploadFile] = File(...),
     metadata: str | None = Form(None),
+    collection: str | None = Form(None),
+    _key: str | None = Depends(verify_api_key),
 ):
     """Ingest multiple files at once.
-    
+
     Each file gets its own document_id for individual management.
     """
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(collection) if collection else get_pipeline()
+    )
 
-    # Parse extra metadata if provided
     extra_meta = {}
     if metadata:
         import json
@@ -135,14 +143,13 @@ async def ingest_files(
             tmp_path = tmp.name
 
         try:
-            # Each file gets its own document_id
             meta = generate_document_metadata(
                 source_type="file",
                 source=file.filename or "uploaded_file",
                 filename=file.filename,
                 extra=extra_meta,
             )
-            
+
             chunks = pipeline.ingest(tmp_path, metadata=meta)
             total_chunks += chunks
             document_ids.append(meta["document_id"])
@@ -165,20 +172,27 @@ async def ingest_files(
 
 
 @router.post("/ingest/url", response_model=IngestResponse)
-async def ingest_url(request: IngestURLRequest):
+async def ingest_url(
+    request: IngestURLRequest,
+    _key: str | None = Depends(verify_api_key),
+):
     """Ingest content from a URL."""
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(request.collection)
+        if request.collection
+        else get_pipeline()
+    )
 
     try:
-        # Generate document metadata
         meta = generate_document_metadata(
             source_type="url",
             source=request.url,
             extra=request.metadata,
         )
-        
+
         chunks = pipeline.ingest(request.url, metadata=meta)
 
+        logger.info("Ingested URL %s: %d chunks", request.url, chunks)
         return IngestResponse(
             success=True,
             chunks_indexed=chunks,
@@ -186,6 +200,7 @@ async def ingest_url(request: IngestURLRequest):
             document_id=meta["document_id"],
         )
     except Exception as e:
+        logger.error("Failed to ingest URL %s: %s", request.url, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -194,11 +209,14 @@ async def ingest_text(
     text: str = Form(...),
     source: str = Form("manual"),
     metadata: str | None = Form(None),
+    collection: str | None = Form(None),
+    _key: str | None = Depends(verify_api_key),
 ):
     """Ingest raw text content."""
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(collection) if collection else get_pipeline()
+    )
 
-    # Parse extra metadata if provided
     extra_meta = {}
     if metadata:
         import json
@@ -208,14 +226,12 @@ async def ingest_text(
             pass
 
     try:
-        # Generate document metadata
         meta = generate_document_metadata(
             source_type="text",
             source=source,
             extra=extra_meta,
         )
-        
-        # Create a temporary file with the text
+
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=".txt", mode="w", encoding="utf-8"
         ) as tmp:
@@ -225,6 +241,7 @@ async def ingest_text(
         chunks = pipeline.ingest(tmp_path, metadata=meta)
         Path(tmp_path).unlink(missing_ok=True)
 
+        logger.info("Ingested text (%s): %d chunks", source, chunks)
         return IngestResponse(
             success=True,
             chunks_indexed=chunks,
@@ -232,4 +249,5 @@ async def ingest_text(
             document_id=meta["document_id"],
         )
     except Exception as e:
+        logger.error("Failed to ingest text: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

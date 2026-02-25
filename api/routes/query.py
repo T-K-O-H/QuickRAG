@@ -3,12 +3,15 @@
 import json
 from typing import AsyncIterator
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from api.dependencies import get_pipeline
+from api.auth import verify_api_key
+from api.dependencies import get_pipeline, get_pipeline_for_collection
+from quickrag.logging import get_logger
 
+logger = get_logger(__name__)
 
 router = APIRouter()
 
@@ -19,6 +22,9 @@ class QueryRequest(BaseModel):
     query: str
     stream: bool = False
     top_k: int | None = None
+    collection: str | None = None
+    filter: dict | None = None
+    conversational: bool = False
 
 
 class SourceDocument(BaseModel):
@@ -38,18 +44,26 @@ class QueryResponse(BaseModel):
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
+async def query(request: QueryRequest, _key: str | None = Depends(verify_api_key)):
     """Query the RAG pipeline.
 
-    Returns an answer based on retrieved documents.
+    Returns an answer based on retrieved documents.  Supports optional
+    metadata filtering, per-collection targeting, and conversational mode.
     """
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(request.collection)
+        if request.collection
+        else get_pipeline()
+    )
 
     if request.top_k:
         pipeline.top_k = request.top_k
 
     try:
-        response = await pipeline.aquery(request.query)
+        if request.conversational:
+            response = pipeline.query_conversational(request.query)
+        else:
+            response = await pipeline.aquery(request.query, filter=request.filter)
 
         sources = [
             SourceDocument(
@@ -66,24 +80,28 @@ async def query(request: QueryRequest):
             query=response.query,
         )
     except Exception as e:
+        logger.error("Query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/query/stream")
-async def query_stream(request: QueryRequest):
+async def query_stream(request: QueryRequest, _key: str | None = Depends(verify_api_key)):
     """Stream a response from the RAG pipeline.
 
     Returns Server-Sent Events with response chunks.
     """
-    pipeline = get_pipeline()
+    pipeline = (
+        get_pipeline_for_collection(request.collection)
+        if request.collection
+        else get_pipeline()
+    )
 
     if request.top_k:
         pipeline.top_k = request.top_k
 
     async def generate() -> AsyncIterator[str]:
         try:
-            # First, get sources
-            results = pipeline._retrieve(request.query)
+            results = pipeline._retrieve(request.query, filter=request.filter)
             sources = [
                 {
                     "content": s.document.content,
@@ -93,17 +111,15 @@ async def query_stream(request: QueryRequest):
                 for s in results
             ]
 
-            # Send sources first
             yield f"data: {json.dumps({'type': 'sources', 'data': sources})}\n\n"
 
-            # Stream the answer
-            async for chunk in pipeline.astream(request.query):
+            async for chunk in pipeline.astream(request.query, filter=request.filter):
                 yield f"data: {json.dumps({'type': 'chunk', 'data': chunk})}\n\n"
 
-            # Send done signal
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
+            logger.error("Stream failed: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'data': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -115,3 +131,17 @@ async def query_stream(request: QueryRequest):
         },
     )
 
+
+@router.post("/query/clear-history")
+async def clear_history(
+    collection: str | None = None,
+    _key: str | None = Depends(verify_api_key),
+):
+    """Clear conversation history for a pipeline."""
+    pipeline = (
+        get_pipeline_for_collection(collection)
+        if collection
+        else get_pipeline()
+    )
+    pipeline.clear_history()
+    return {"success": True, "message": "Conversation history cleared"}
