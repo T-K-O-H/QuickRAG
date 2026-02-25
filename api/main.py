@@ -8,32 +8,36 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import query, ingest, collections, documents
 from api.dependencies import get_pipeline
+from quickrag.config import settings
+from quickrag.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifespan context manager for startup/shutdown."""
-    # Startup: Initialize pipeline
-    print("[QuickRAG] API starting up...")
+    logger.info("API starting up...")
     pipeline = get_pipeline()
-    print(f"[QuickRAG] Connected to collection: {pipeline.store.collection}")
-    print(f"[QuickRAG] Documents in store: {pipeline.count()}")
+    logger.info("Connected to collection: %s", pipeline.store.collection)
+    logger.info("Documents in store: %d", pipeline.count())
+    auth_enabled = bool(settings.get_api_keys())
+    logger.info("API key authentication: %s", "enabled" if auth_enabled else "disabled")
     yield
-    # Shutdown
-    print("[QuickRAG] API shutting down...")
+    logger.info("API shutting down...")
 
 
 app = FastAPI(
     title="QuickRAG API",
     description="Fast, plug-and-play RAG API built on LangGraph",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
-# CORS middleware for frontend
+# CORS middleware — origins from config
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,4 +69,3 @@ async def health():
         "collection": pipeline.store.collection,
         "document_count": pipeline.count(),
     }
-

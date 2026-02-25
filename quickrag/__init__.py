@@ -1,19 +1,29 @@
 """QuickRAG - Fast, plug-and-play RAG framework built on LangGraph."""
 
-from quickrag.pipeline import RAGPipeline
+from quickrag.pipeline import RAGPipeline, RAGResponse
 from quickrag.stores.qdrant import QdrantStore
+from quickrag.stores.base import Document, SearchResult
 from quickrag.embeddings.local import LocalEmbeddings
 from quickrag.embeddings.openai import OpenAIEmbeddings
 from quickrag.llms.ollama import OllamaLLM
 from quickrag.llms.openai import OpenAILLM
+from quickrag.loaders.csv_loader import CSVLoader
+from quickrag.loaders.json_loader import JSONLoader
+from quickrag.loaders.docx_loader import DocxLoader
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "RAGPipeline",
+    "RAGResponse",
     "QdrantStore",
+    "Document",
+    "SearchResult",
     "LocalEmbeddings",
     "OpenAIEmbeddings",
     "OllamaLLM",
     "OpenAILLM",
+    "CSVLoader",
+    "JSONLoader",
+    "DocxLoader",
 ]
 

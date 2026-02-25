@@ -29,7 +29,26 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=512, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=50, alias="CHUNK_OVERLAP")
 
+    # API authentication (comma-separated keys, empty = no auth required)
+    api_keys: str | None = Field(default=None, alias="QUICKRAG_API_KEYS")
+
+    # CORS origins (comma-separated)
+    cors_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        alias="CORS_ORIGINS",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    def get_api_keys(self) -> list[str]:
+        """Parse comma-separated API keys."""
+        if not self.api_keys:
+            return []
+        return [k.strip() for k in self.api_keys.split(",") if k.strip()]
+
+    def get_cors_origins(self) -> list[str]:
+        """Parse comma-separated CORS origins."""
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
 
 settings = Settings()

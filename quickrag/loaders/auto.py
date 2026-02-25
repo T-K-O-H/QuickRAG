@@ -7,6 +7,12 @@ from quickrag.loaders.base import BaseLoader, LoadedDocument
 from quickrag.loaders.text import TextLoader
 from quickrag.loaders.pdf import PDFLoader
 from quickrag.loaders.web import WebLoader
+from quickrag.loaders.csv_loader import CSVLoader
+from quickrag.loaders.json_loader import JSONLoader
+from quickrag.loaders.docx_loader import DocxLoader
+from quickrag.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class AutoLoader(BaseLoader):
@@ -15,6 +21,9 @@ class AutoLoader(BaseLoader):
     Supports:
     - Text files (.txt, .md, .markdown, .rst)
     - PDF files (.pdf)
+    - CSV/TSV files (.csv, .tsv)
+    - JSON/JSONL files (.json, .jsonl)
+    - Word documents (.docx)
     - Web pages (http://, https://)
     - Directories (recursively loads all supported files)
     """
@@ -24,6 +33,9 @@ class AutoLoader(BaseLoader):
         self.loaders = [
             WebLoader(),
             PDFLoader(),
+            CSVLoader(),
+            JSONLoader(),
+            DocxLoader(),
             TextLoader(),
         ]
 
@@ -72,8 +84,7 @@ class AutoLoader(BaseLoader):
                         docs = loader.load(file_path)
                         documents.extend(docs)
                     except Exception as e:
-                        # Log but continue on errors
-                        print(f"Warning: Failed to load {file_path}: {e}")
+                        logger.warning("Failed to load %s: %s", file_path, e)
 
         return documents
 

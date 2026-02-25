@@ -15,6 +15,9 @@ from quickrag.llms.openai import OpenAILLM
 from quickrag.loaders.auto import load as auto_load
 from quickrag.chunkers.text import RecursiveChunker
 from quickrag.config import settings
+from quickrag.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -48,6 +51,7 @@ class RAGPipeline:
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
         top_k: int | None = None,
+        use_graph: bool = False,
     ):
         """Initialize RAG pipeline.
 
@@ -58,11 +62,13 @@ class RAGPipeline:
             chunk_size: Chunk size for splitting documents.
             chunk_overlap: Overlap between chunks.
             top_k: Number of documents to retrieve.
+            use_graph: Whether to use LangGraph workflow for queries.
         """
         self.embeddings = embeddings or LocalEmbeddings()
         self.store = store or QdrantStore(embedding_dim=self.embeddings.dimension)
         self.llm = llm or OllamaLLM()
         self.top_k = top_k or settings.retrieval_top_k
+        self.use_graph = use_graph
 
         self.chunker = RecursiveChunker(
             chunk_size=chunk_size or settings.chunk_size,
@@ -75,6 +81,13 @@ class RAGPipeline:
         self._custom_router: Callable | None = None
         self._custom_generator: Callable | None = None
 
+        # Conversation memory: list of {"role": ..., "content": ...} dicts
+        self._conversation_history: list[dict[str, str]] = []
+        self._conversational_graph = None
+
+        # LangGraph compiled graph (lazy-built)
+        self._graph = None
+
         # System prompt
         self.system_prompt = """You are a helpful assistant that answers questions based on the provided context.
 
@@ -85,12 +98,19 @@ Context:
 
 Answer the question accurately and concisely based on the context above."""
 
+        logger.info("Pipeline initialized (graph=%s)", use_graph)
+
+    # ------------------------------------------------------------------
+    # Factory methods
+    # ------------------------------------------------------------------
+
     @classmethod
     def local(
         cls,
         collection: str | None = None,
         embedding_model: str = "bge-small-en-v1.5",
         llm_model: str = "llama3.2",
+        use_graph: bool = False,
     ) -> "RAGPipeline":
         """Create a fully local pipeline.
 
@@ -101,6 +121,7 @@ Answer the question accurately and concisely based on the context above."""
             collection: Qdrant collection name.
             embedding_model: Local embedding model name.
             llm_model: Ollama model name.
+            use_graph: Whether to use LangGraph workflow.
 
         Returns:
             Configured RAGPipeline.
@@ -113,6 +134,7 @@ Answer the question accurately and concisely based on the context above."""
             ),
             embeddings=embeddings,
             llm=OllamaLLM(llm_model),
+            use_graph=use_graph,
         )
 
     @classmethod
@@ -122,6 +144,7 @@ Answer the question accurately and concisely based on the context above."""
         embedding_model: str = "text-embedding-3-small",
         llm_model: str = "gpt-4o-mini",
         api_key: str | None = None,
+        use_graph: bool = False,
     ) -> "RAGPipeline":
         """Create a cloud-based pipeline using OpenAI.
 
@@ -132,6 +155,7 @@ Answer the question accurately and concisely based on the context above."""
             embedding_model: OpenAI embedding model.
             llm_model: OpenAI LLM model.
             api_key: OpenAI API key.
+            use_graph: Whether to use LangGraph workflow.
 
         Returns:
             Configured RAGPipeline.
@@ -144,6 +168,7 @@ Answer the question accurately and concisely based on the context above."""
             ),
             embeddings=embeddings,
             llm=OpenAILLM(llm_model, api_key=api_key),
+            use_graph=use_graph,
         )
 
     @classmethod
@@ -153,6 +178,7 @@ Answer the question accurately and concisely based on the context above."""
         embedding_model: str = "bge-small-en-v1.5",
         llm_model: str = "gpt-4o-mini",
         api_key: str | None = None,
+        use_graph: bool = False,
     ) -> "RAGPipeline":
         """Create a hybrid pipeline (local embeddings + cloud LLM).
 
@@ -163,6 +189,7 @@ Answer the question accurately and concisely based on the context above."""
             embedding_model: Local embedding model.
             llm_model: OpenAI LLM model.
             api_key: OpenAI API key.
+            use_graph: Whether to use LangGraph workflow.
 
         Returns:
             Configured RAGPipeline.
@@ -175,9 +202,35 @@ Answer the question accurately and concisely based on the context above."""
             ),
             embeddings=embeddings,
             llm=OpenAILLM(llm_model, api_key=api_key),
+            use_graph=use_graph,
         )
 
+    # ------------------------------------------------------------------
+    # LangGraph integration
+    # ------------------------------------------------------------------
+
+    def _get_graph(self):
+        """Lazily build and return the compiled LangGraph RAG workflow."""
+        if self._graph is None:
+            from quickrag.graph import create_rag_graph
+
+            self._graph = create_rag_graph(self)
+            logger.info("LangGraph RAG workflow compiled")
+        return self._graph
+
+    def _get_conversational_graph(self):
+        """Lazily build and return the conversational RAG graph."""
+        if self._conversational_graph is None:
+            from quickrag.graph import create_conversational_rag_graph
+
+            self._conversational_graph = create_conversational_rag_graph(self)
+            logger.info("LangGraph conversational workflow compiled")
+        return self._conversational_graph
+
+    # ------------------------------------------------------------------
     # Decorator methods for customization
+    # ------------------------------------------------------------------
+
     def chunker(self, func: Callable) -> Callable:
         """Decorator to set a custom chunker function.
 
@@ -224,6 +277,10 @@ Answer the question accurately and concisely based on the context above."""
         self._custom_generator = func
         return func
 
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
     def ingest(
         self,
         source: Union[str, Path, list],
@@ -232,7 +289,7 @@ Answer the question accurately and concisely based on the context above."""
         """Ingest documents from a source.
 
         Automatically detects file types and handles:
-        - Single files (PDF, TXT, MD, etc.)
+        - Single files (PDF, TXT, MD, CSV, JSON, DOCX, etc.)
         - Directories (recursively)
         - URLs (web pages)
         - Lists of any of the above
@@ -244,10 +301,9 @@ Answer the question accurately and concisely based on the context above."""
         Returns:
             Number of chunks indexed.
         """
-        # Load documents
+        logger.info("Ingesting from: %s", source)
         loaded_docs = auto_load(source)
 
-        # Chunk documents
         all_chunks = []
         for doc in loaded_docs:
             chunk_metadata = {**(metadata or {}), **doc.metadata}
@@ -260,36 +316,38 @@ Answer the question accurately and concisely based on the context above."""
             all_chunks.extend(chunks)
 
         if not all_chunks:
+            logger.warning("No chunks produced from source: %s", source)
             return 0
 
-        # Create Document objects
         documents = [
             Document(content=chunk.content, metadata=chunk.metadata)
             for chunk in all_chunks
         ]
 
-        # Generate embeddings
         texts = [chunk.content for chunk in all_chunks]
         embeddings = self.embeddings.embed_documents(texts)
 
-        # Store in vector database
         self.store.add(documents, embeddings)
 
+        logger.info("Indexed %d chunks from %s", len(documents), source)
         return len(documents)
 
-    def _retrieve(self, query: str) -> list[SearchResult]:
+    # ------------------------------------------------------------------
+    # Retrieval helpers
+    # ------------------------------------------------------------------
+
+    def _retrieve(self, query: str, filter: dict[str, Any] | None = None) -> list[SearchResult]:
         """Retrieve relevant documents for a query."""
         if self._custom_retriever:
             return self._custom_retriever(query, self.top_k)
 
-        # Embed query
         query_embedding = self.embeddings.embed_query(query)
 
-        # Search with hybrid (semantic + BM25)
         results = self.store.search(
             query_embedding=query_embedding,
             top_k=self.top_k,
-            query_text=query,  # For BM25
+            query_text=query,
+            filter=filter,
         )
 
         return results
@@ -313,23 +371,35 @@ Answer the question accurately and concisely based on the context above."""
         if self._custom_router:
             return self._custom_router(query)
 
-        # Default: always use retrieval
         return "retrieval"
 
-    def query(self, query: str) -> RAGResponse:
+    # ------------------------------------------------------------------
+    # Query methods
+    # ------------------------------------------------------------------
+
+    def query(
+        self,
+        query: str,
+        filter: dict[str, Any] | None = None,
+    ) -> RAGResponse:
         """Query the RAG pipeline.
+
+        If ``use_graph`` is enabled, the query is executed via the compiled
+        LangGraph workflow.  Otherwise the default inline logic is used.
 
         Args:
             query: User question.
+            filter: Optional metadata filter for retrieval.
 
         Returns:
             RAGResponse with answer and sources.
         """
-        # Route query
+        if self.use_graph:
+            return self._query_via_graph(query)
+
         route = self._route(query)
 
         if route == "direct":
-            # Direct LLM response without retrieval
             response = self.llm.generate(query)
             return RAGResponse(
                 answer=response.content,
@@ -338,13 +408,9 @@ Answer the question accurately and concisely based on the context above."""
                 metadata={"route": "direct"},
             )
 
-        # Retrieve relevant documents
-        results = self._retrieve(query)
-
-        # Build context
+        results = self._retrieve(query, filter=filter)
         context = self._build_context(results)
 
-        # Generate response
         if self._custom_generator:
             answer = self._custom_generator(query, context)
         else:
@@ -359,16 +425,40 @@ Answer the question accurately and concisely based on the context above."""
             metadata={"route": route, "num_sources": len(results)},
         )
 
-    async def aquery(self, query: str) -> RAGResponse:
+    def _query_via_graph(self, query: str) -> RAGResponse:
+        """Execute a query through the LangGraph workflow."""
+        graph = self._get_graph()
+        result = graph.invoke(
+            {
+                "query": query,
+                "route": "",
+                "context": "",
+                "sources": [],
+                "answer": "",
+                "messages": [],
+            }
+        )
+        return RAGResponse(
+            answer=result["answer"],
+            sources=result.get("sources", []),
+            query=query,
+            metadata={"route": result.get("route", ""), "graph": True},
+        )
+
+    async def aquery(
+        self,
+        query: str,
+        filter: dict[str, Any] | None = None,
+    ) -> RAGResponse:
         """Async query the RAG pipeline.
 
         Args:
             query: User question.
+            filter: Optional metadata filter for retrieval.
 
         Returns:
             RAGResponse with answer and sources.
         """
-        # Route query
         route = self._route(query)
 
         if route == "direct":
@@ -380,11 +470,9 @@ Answer the question accurately and concisely based on the context above."""
                 metadata={"route": "direct"},
             )
 
-        # Retrieve
-        results = self._retrieve(query)
+        results = self._retrieve(query, filter=filter)
         context = self._build_context(results)
 
-        # Generate
         if self._custom_generator:
             answer = self._custom_generator(query, context)
         else:
@@ -399,16 +487,20 @@ Answer the question accurately and concisely based on the context above."""
             metadata={"route": route, "num_sources": len(results)},
         )
 
-    async def astream(self, query: str) -> AsyncIterator[str]:
+    async def astream(
+        self,
+        query: str,
+        filter: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]:
         """Stream a response from the RAG pipeline.
 
         Args:
             query: User question.
+            filter: Optional metadata filter for retrieval.
 
         Yields:
             Response chunks as strings.
         """
-        # Route query
         route = self._route(query)
 
         if route == "direct":
@@ -416,20 +508,68 @@ Answer the question accurately and concisely based on the context above."""
                 yield chunk
             return
 
-        # Retrieve
-        results = self._retrieve(query)
+        results = self._retrieve(query, filter=filter)
         context = self._build_context(results)
 
-        # Stream generation
         prompt = self.system_prompt.format(context=context) + f"\n\nQuestion: {query}"
         async for chunk in self.llm.astream(prompt):
             yield chunk
 
+    # ------------------------------------------------------------------
+    # Conversational query (uses LangGraph with memory)
+    # ------------------------------------------------------------------
+
+    def query_conversational(self, query: str) -> RAGResponse:
+        """Query with conversation memory.
+
+        Uses the conversational LangGraph workflow that rewrites follow-up
+        questions using prior context and maintains chat history.
+
+        Args:
+            query: User question.
+
+        Returns:
+            RAGResponse with answer and sources.
+        """
+        graph = self._get_conversational_graph()
+        result = graph.invoke(
+            {
+                "query": query,
+                "route": "",
+                "context": "",
+                "sources": [],
+                "answer": "",
+                "messages": list(self._conversation_history),
+            }
+        )
+
+        self._conversation_history = result.get("messages", [])
+
+        return RAGResponse(
+            answer=result["answer"],
+            sources=result.get("sources", []),
+            query=query,
+            metadata={
+                "route": result.get("route", ""),
+                "conversational": True,
+                "history_length": len(self._conversation_history),
+            },
+        )
+
+    def clear_history(self) -> None:
+        """Clear conversation memory."""
+        self._conversation_history.clear()
+        logger.info("Conversation history cleared")
+
+    # ------------------------------------------------------------------
+    # Store operations
+    # ------------------------------------------------------------------
+
     def clear(self) -> None:
         """Clear all documents from the store."""
         self.store.clear()
+        logger.info("Store cleared")
 
     def count(self) -> int:
         """Return the number of documents in the store."""
         return self.store.count()
-

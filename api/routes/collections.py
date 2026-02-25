@@ -1,10 +1,13 @@
 """Collection management endpoints for QuickRAG API."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from api.dependencies import get_pipeline
+from api.auth import verify_api_key
+from api.dependencies import get_pipeline, get_pipeline_for_collection
+from quickrag.logging import get_logger
 
+logger = get_logger(__name__)
 
 router = APIRouter()
 
@@ -25,19 +28,17 @@ class CollectionListResponse(BaseModel):
 
 
 @router.get("/collections", response_model=CollectionListResponse)
-async def list_collections():
+async def list_collections(_key: str | None = Depends(verify_api_key)):
     """List all collections."""
     pipeline = get_pipeline()
 
     try:
-        # Get current collection info
         current = CollectionInfo(
             name=pipeline.store.collection,
             document_count=pipeline.count(),
             embedding_dim=pipeline.embeddings.dimension,
         )
 
-        # Get all collections from Qdrant
         collections_response = pipeline.store._client.get_collections()
         collections = []
 
@@ -45,13 +46,12 @@ async def list_collections():
             if col.name == pipeline.store.collection:
                 collections.append(current)
             else:
-                # Get info for other collections
                 info = pipeline.store._client.get_collection(col.name)
                 collections.append(
                     CollectionInfo(
                         name=col.name,
                         document_count=info.points_count or 0,
-                        embedding_dim=0,  # Can't easily get this for other collections
+                        embedding_dim=0,
                     )
                 )
 
@@ -60,11 +60,12 @@ async def list_collections():
             current=pipeline.store.collection,
         )
     except Exception as e:
+        logger.error("Failed to list collections: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/collections/{name}", response_model=CollectionInfo)
-async def get_collection(name: str):
+async def get_collection(name: str, _key: str | None = Depends(verify_api_key)):
     """Get information about a specific collection."""
     pipeline = get_pipeline()
 
@@ -76,7 +77,6 @@ async def get_collection(name: str):
                 embedding_dim=pipeline.embeddings.dimension,
             )
 
-        # Get info for other collection
         info = pipeline.store._client.get_collection(name)
         return CollectionInfo(
             name=name,
@@ -87,26 +87,46 @@ async def get_collection(name: str):
         raise HTTPException(status_code=404, detail=f"Collection not found: {name}")
 
 
+@router.post("/collections/{name}/switch")
+async def switch_collection(name: str, _key: str | None = Depends(verify_api_key)):
+    """Get or create a pipeline bound to a specific collection.
+
+    This enables multi-tenant workflows where different tenants operate on
+    separate collections.
+    """
+    try:
+        pipeline = get_pipeline_for_collection(name)
+        logger.info("Switched to collection: %s", name)
+        return {
+            "success": True,
+            "collection": name,
+            "document_count": pipeline.count(),
+        }
+    except Exception as e:
+        logger.error("Failed to switch to collection %s: %s", name, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/collections/{name}")
-async def delete_collection(name: str):
+async def delete_collection(name: str, _key: str | None = Depends(verify_api_key)):
     """Delete a collection and all its documents."""
     pipeline = get_pipeline()
 
     try:
         if name == pipeline.store.collection:
-            # Clear current collection
             pipeline.clear()
             return {"success": True, "message": f"Cleared collection: {name}"}
 
-        # Delete other collection
         pipeline.store._client.delete_collection(name)
+        logger.info("Deleted collection: %s", name)
         return {"success": True, "message": f"Deleted collection: {name}"}
     except Exception as e:
+        logger.error("Failed to delete collection %s: %s", name, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/collections/{name}/clear")
-async def clear_collection(name: str):
+async def clear_collection(name: str, _key: str | None = Depends(verify_api_key)):
     """Clear all documents from a collection without deleting it."""
     pipeline = get_pipeline()
 
@@ -125,5 +145,5 @@ async def clear_collection(name: str):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("Failed to clear collection %s: %s", name, e)
         raise HTTPException(status_code=500, detail=str(e))
-

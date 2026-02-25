@@ -9,6 +9,9 @@ from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
 
 from quickrag.stores.base import BaseStore, Document, SearchResult
 from quickrag.config import settings
+from quickrag.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class QdrantStore(BaseStore):
@@ -71,27 +74,41 @@ class QdrantStore(BaseStore):
                 sparse_vectors_config=sparse_vectors_config,
             )
 
-    def _compute_sparse_vector(self, text: str) -> tuple[list[int], list[float]]:
-        """Compute sparse BM25-style vector for text.
+    def _compute_sparse_vector(
+        self, text: str, avg_dl: float = 256.0, k1: float = 1.5, b: float = 0.75
+    ) -> tuple[list[int], list[float]]:
+        """Compute BM25-weighted sparse vector for text.
 
-        Uses simple term frequency for fast local computation.
+        Uses BM25 term-frequency normalization:
+            tf_bm25 = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
+
+        Combined with Qdrant's RRF fusion this provides proper hybrid retrieval.
+
+        Args:
+            text: The input text.
+            avg_dl: Assumed average document length (in tokens).
+            k1: BM25 term saturation parameter.
+            b: BM25 length normalization parameter.
+
+        Returns:
+            Tuple of (indices, values) for a sparse vector.
         """
         from collections import Counter, defaultdict
         import re
 
-        # Tokenize and count
         tokens = re.findall(r"\w+", text.lower())
+        if not tokens:
+            return [], []
+
+        dl = len(tokens)
         counts = Counter(tokens)
 
-        # Create sparse vector with unique indices
-        # Aggregate values for hash collisions
-        index_values = defaultdict(float)
-        for token, count in counts.items():
-            # Hash token to index (simple approach)
-            idx = hash(token) % 100000
-            index_values[idx] += float(count)
+        index_values: defaultdict[int, float] = defaultdict(float)
+        for token, tf in counts.items():
+            tf_bm25 = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
+            idx = abs(hash(token)) % 1_000_000
+            index_values[idx] += tf_bm25
 
-        # Convert to sorted lists (Qdrant prefers sorted indices)
         sorted_items = sorted(index_values.items())
         indices = [idx for idx, _ in sorted_items]
         values = [val for _, val in sorted_items]
