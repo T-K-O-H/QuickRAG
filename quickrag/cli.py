@@ -80,14 +80,18 @@ def main():
         print("=" * 50)
         print(response.answer)
 
-        if response.sources:
+        if response.citations:
             print("\n" + "=" * 50)
-            print(f"SOURCES ({len(response.sources)}):")
+            print(f"CITATIONS ({len(response.citations)}):")
             print("=" * 50)
-            for i, source in enumerate(response.sources, 1):
-                print(f"\n[{i}] Score: {source.score:.2f}")
-                preview = source.document.content[:150].replace("\n", " ")
-                print(f"    {preview}...")
+            for cit in response.citations:
+                loc = cit.source
+                if cit.page is not None:
+                    loc += f", Page {cit.page}"
+                if cit.chunk_index is not None:
+                    loc += f", Chunk {cit.chunk_index}"
+                print(f"\n{cit.ref} {loc}  (score: {cit.score:.2f})")
+                print(f"    {cit.content_preview}...")
 
     elif args.command == "info":
         from quickrag import RAGPipeline
