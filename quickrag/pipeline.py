@@ -21,12 +21,26 @@ logger = get_logger(__name__)
 
 
 @dataclass
+class Citation:
+    """A reference citation linking an answer back to a source chunk."""
+
+    ref: str
+    source: str
+    page: int | None = None
+    chunk_index: int | None = None
+    score: float = 0.0
+    content_preview: str = ""
+    document_id: str | None = None
+
+
+@dataclass
 class RAGResponse:
     """Response from RAG pipeline."""
 
     answer: str
     sources: list[SearchResult]
     query: str
+    citations: list[Citation] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -88,15 +102,17 @@ class RAGPipeline:
         # LangGraph compiled graph (lazy-built)
         self._graph = None
 
-        # System prompt
+        # System prompt — instructs the LLM to cite sources using [n] markers
         self.system_prompt = """You are a helpful assistant that answers questions based on the provided context.
 
 Use the context below to answer the question. If the context doesn't contain enough information to answer the question, say so clearly.
 
+IMPORTANT: When you use information from the context, cite the source by including the reference number in square brackets, e.g. [1], [2]. You may cite multiple sources for the same claim, e.g. [1][3]. Always include at least one citation for each factual claim.
+
 Context:
 {context}
 
-Answer the question accurately and concisely based on the context above."""
+Answer the question accurately and concisely based on the context above, citing sources with [n] markers."""
 
         logger.info("Pipeline initialized (graph=%s)", use_graph)
 
@@ -353,18 +369,79 @@ Answer the question accurately and concisely based on the context above."""
         return results
 
     def _build_context(self, results: list[SearchResult]) -> str:
-        """Build context string from search results."""
+        """Build context string from search results with citation labels."""
         if not results:
             return "No relevant context found."
 
         context_parts = []
         for i, result in enumerate(results, 1):
-            source = result.document.metadata.get("source", "Unknown")
+            label = self._format_source_label(result, i)
             context_parts.append(
-                f"[{i}] {result.document.content}\n(Source: {source})"
+                f"[{i}] {result.document.content}\n({label})"
             )
 
         return "\n\n".join(context_parts)
+
+    @staticmethod
+    def _format_source_label(result: SearchResult, index: int) -> str:
+        """Build a human-readable source label like 'report.pdf, Page 6'."""
+        meta = result.document.metadata
+        parts: list[str] = []
+
+        # Document name — prefer original_filename > filename > source
+        name = (
+            meta.get("original_filename")
+            or meta.get("filename")
+            or meta.get("source", "Unknown")
+        )
+        parts.append(f"Source: {name}")
+
+        page = meta.get("page") or meta.get("page_number")
+        if page is not None:
+            parts.append(f"Page {page}")
+
+        row = meta.get("row_index")
+        if row is not None:
+            parts.append(f"Row {row}")
+
+        chunk_idx = meta.get("chunk_index")
+        if chunk_idx is not None:
+            parts.append(f"Chunk {chunk_idx}")
+
+        return ", ".join(parts)
+
+    def _build_citations(self, results: list[SearchResult]) -> list[Citation]:
+        """Build structured citations from search results."""
+        citations: list[Citation] = []
+        for i, result in enumerate(results, 1):
+            meta = result.document.metadata
+            name = (
+                meta.get("original_filename")
+                or meta.get("filename")
+                or meta.get("source", "Unknown")
+            )
+            page = meta.get("page") or meta.get("page_number")
+            if page is not None:
+                page = int(page)
+
+            chunk_idx = meta.get("chunk_index")
+            if chunk_idx is not None:
+                chunk_idx = int(chunk_idx)
+
+            preview = result.document.content[:120].replace("\n", " ")
+
+            citations.append(
+                Citation(
+                    ref=f"[{i}]",
+                    source=name,
+                    page=page,
+                    chunk_index=chunk_idx,
+                    score=result.score,
+                    content_preview=preview,
+                    document_id=meta.get("document_id"),
+                )
+            )
+        return citations
 
     def _route(self, query: str) -> str:
         """Route the query to appropriate handler."""
@@ -405,11 +482,13 @@ Answer the question accurately and concisely based on the context above."""
                 answer=response.content,
                 sources=[],
                 query=query,
+                citations=[],
                 metadata={"route": "direct"},
             )
 
         results = self._retrieve(query, filter=filter)
         context = self._build_context(results)
+        citations = self._build_citations(results)
 
         if self._custom_generator:
             answer = self._custom_generator(query, context)
@@ -422,6 +501,7 @@ Answer the question accurately and concisely based on the context above."""
             answer=answer,
             sources=results,
             query=query,
+            citations=citations,
             metadata={"route": route, "num_sources": len(results)},
         )
 
@@ -438,10 +518,12 @@ Answer the question accurately and concisely based on the context above."""
                 "messages": [],
             }
         )
+        sources = result.get("sources", [])
         return RAGResponse(
             answer=result["answer"],
-            sources=result.get("sources", []),
+            sources=sources,
             query=query,
+            citations=self._build_citations(sources),
             metadata={"route": result.get("route", ""), "graph": True},
         )
 
@@ -467,11 +549,13 @@ Answer the question accurately and concisely based on the context above."""
                 answer=response.content,
                 sources=[],
                 query=query,
+                citations=[],
                 metadata={"route": "direct"},
             )
 
         results = self._retrieve(query, filter=filter)
         context = self._build_context(results)
+        citations = self._build_citations(results)
 
         if self._custom_generator:
             answer = self._custom_generator(query, context)
@@ -484,6 +568,7 @@ Answer the question accurately and concisely based on the context above."""
             answer=answer,
             sources=results,
             query=query,
+            citations=citations,
             metadata={"route": route, "num_sources": len(results)},
         )
 
@@ -544,11 +629,13 @@ Answer the question accurately and concisely based on the context above."""
         )
 
         self._conversation_history = result.get("messages", [])
+        sources = result.get("sources", [])
 
         return RAGResponse(
             answer=result["answer"],
-            sources=result.get("sources", []),
+            sources=sources,
             query=query,
+            citations=self._build_citations(sources),
             metadata={
                 "route": result.get("route", ""),
                 "conversational": True,

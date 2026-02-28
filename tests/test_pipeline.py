@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
-from quickrag.pipeline import RAGPipeline, RAGResponse
+from quickrag.pipeline import RAGPipeline, RAGResponse, Citation
 from quickrag.stores.base import Document, SearchResult
 from quickrag.llms.base import LLMResponse
 
@@ -91,7 +91,7 @@ class TestRAGPipelineQuery:
         pipeline._conversation_history = []
         pipeline._conversational_graph = None
         pipeline._graph = None
-        pipeline.system_prompt = "Context:\n{context}\n\nAnswer:"
+        pipeline.system_prompt = "Context:\n{context}\n\nAnswer with [n] citations:"
         return pipeline
 
     def test_query_retrieval(self):
@@ -106,6 +106,8 @@ class TestRAGPipelineQuery:
         assert isinstance(response, RAGResponse)
         assert response.answer == "Answer"
         assert len(response.sources) == 1
+        assert len(response.citations) == 1
+        assert response.citations[0].ref == "[1]"
         assert response.metadata["route"] == "retrieval"
 
     def test_query_direct_route(self):
@@ -117,6 +119,7 @@ class TestRAGPipelineQuery:
 
         assert response.answer == "Direct answer"
         assert response.sources == []
+        assert response.citations == []
         assert response.metadata["route"] == "direct"
 
     def test_build_context_empty(self):
@@ -149,6 +152,180 @@ class TestRAGPipelineQuery:
         assert pipeline._conversation_history == []
 
 
+class TestCitation:
+    """Tests for the Citation dataclass."""
+
+    def test_basic(self):
+        cit = Citation(ref="[1]", source="report.pdf")
+        assert cit.ref == "[1]"
+        assert cit.source == "report.pdf"
+        assert cit.page is None
+        assert cit.chunk_index is None
+        assert cit.score == 0.0
+
+    def test_with_page(self):
+        cit = Citation(ref="[2]", source="manual.pdf", page=6, score=0.85)
+        assert cit.page == 6
+        assert cit.score == 0.85
+
+    def test_with_all_fields(self):
+        cit = Citation(
+            ref="[3]",
+            source="data.csv",
+            page=None,
+            chunk_index=2,
+            score=0.7,
+            content_preview="Some preview text",
+            document_id="abc-123",
+        )
+        assert cit.chunk_index == 2
+        assert cit.content_preview == "Some preview text"
+        assert cit.document_id == "abc-123"
+
+
+class TestBuildCitations:
+    """Tests for _build_citations."""
+
+    def _make_pipeline(self):
+        pipeline = RAGPipeline.__new__(RAGPipeline)
+        return pipeline
+
+    def test_empty_results(self):
+        pipeline = self._make_pipeline()
+        citations = pipeline._build_citations([])
+        assert citations == []
+
+    def test_single_result_basic(self):
+        pipeline = self._make_pipeline()
+        doc = Document(
+            content="Hello world",
+            metadata={"source": "test.txt", "filename": "test.txt"},
+        )
+        results = [SearchResult(document=doc, score=0.9)]
+
+        citations = pipeline._build_citations(results)
+        assert len(citations) == 1
+        assert citations[0].ref == "[1]"
+        assert citations[0].source == "test.txt"
+        assert citations[0].score == 0.9
+        assert "Hello world" in citations[0].content_preview
+
+    def test_pdf_with_page(self):
+        pipeline = self._make_pipeline()
+        doc = Document(
+            content="PDF content here",
+            metadata={
+                "source": "/path/to/report.pdf",
+                "filename": "report.pdf",
+                "page": 6,
+                "chunk_index": 3,
+                "document_id": "doc-abc",
+            },
+        )
+        results = [SearchResult(document=doc, score=0.85)]
+
+        citations = pipeline._build_citations(results)
+        assert citations[0].source == "report.pdf"
+        assert citations[0].page == 6
+        assert citations[0].chunk_index == 3
+        assert citations[0].document_id == "doc-abc"
+
+    def test_multiple_results_numbered(self):
+        pipeline = self._make_pipeline()
+        docs = [
+            Document(content=f"Doc {i}", metadata={"source": f"file{i}.txt"})
+            for i in range(3)
+        ]
+        results = [SearchResult(document=d, score=0.9 - i * 0.1) for i, d in enumerate(docs)]
+
+        citations = pipeline._build_citations(results)
+        assert len(citations) == 3
+        assert citations[0].ref == "[1]"
+        assert citations[1].ref == "[2]"
+        assert citations[2].ref == "[3]"
+
+    def test_original_filename_preferred(self):
+        pipeline = self._make_pipeline()
+        doc = Document(
+            content="Content",
+            metadata={
+                "source": "/tmp/abc123.pdf",
+                "filename": "abc123.pdf",
+                "original_filename": "Annual Report 2024.pdf",
+            },
+        )
+        results = [SearchResult(document=doc, score=0.8)]
+
+        citations = pipeline._build_citations(results)
+        assert citations[0].source == "Annual Report 2024.pdf"
+
+    def test_page_number_alias(self):
+        """Some loaders use 'page_number' instead of 'page'."""
+        pipeline = self._make_pipeline()
+        doc = Document(
+            content="Content",
+            metadata={"source": "doc.pdf", "page_number": 12},
+        )
+        results = [SearchResult(document=doc, score=0.8)]
+
+        citations = pipeline._build_citations(results)
+        assert citations[0].page == 12
+
+    def test_content_preview_truncated(self):
+        pipeline = self._make_pipeline()
+        long_content = "A" * 300
+        doc = Document(content=long_content, metadata={"source": "big.txt"})
+        results = [SearchResult(document=doc, score=0.5)]
+
+        citations = pipeline._build_citations(results)
+        assert len(citations[0].content_preview) == 120
+
+
+class TestFormatSourceLabel:
+    """Tests for _format_source_label static method."""
+
+    def test_basic_source(self):
+        doc = Document(content="x", metadata={"source": "file.txt"})
+        result = SearchResult(document=doc, score=0.5)
+
+        label = RAGPipeline._format_source_label(result, 1)
+        assert "file.txt" in label
+
+    def test_with_page(self):
+        doc = Document(content="x", metadata={"source": "doc.pdf", "page": 5})
+        result = SearchResult(document=doc, score=0.5)
+
+        label = RAGPipeline._format_source_label(result, 1)
+        assert "Page 5" in label
+
+    def test_with_chunk_index(self):
+        doc = Document(content="x", metadata={"source": "doc.txt", "chunk_index": 3})
+        result = SearchResult(document=doc, score=0.5)
+
+        label = RAGPipeline._format_source_label(result, 1)
+        assert "Chunk 3" in label
+
+    def test_with_row_index(self):
+        doc = Document(content="x", metadata={"source": "data.csv", "row_index": 7})
+        result = SearchResult(document=doc, score=0.5)
+
+        label = RAGPipeline._format_source_label(result, 1)
+        assert "Row 7" in label
+
+    def test_original_filename_preferred(self):
+        doc = Document(
+            content="x",
+            metadata={
+                "source": "/tmp/xyz.pdf",
+                "original_filename": "Report.pdf",
+            },
+        )
+        result = SearchResult(document=doc, score=0.5)
+
+        label = RAGPipeline._format_source_label(result, 1)
+        assert "Report.pdf" in label
+
+
 class TestRAGResponse:
     """Tests for the RAGResponse dataclass."""
 
@@ -156,6 +333,7 @@ class TestRAGResponse:
         resp = RAGResponse(answer="42", sources=[], query="What?")
         assert resp.answer == "42"
         assert resp.query == "What?"
+        assert resp.citations == []
         assert resp.metadata == {}
 
     def test_with_metadata(self):
@@ -163,3 +341,9 @@ class TestRAGResponse:
             answer="yes", sources=[], query="q", metadata={"route": "retrieval"}
         )
         assert resp.metadata["route"] == "retrieval"
+
+    def test_with_citations(self):
+        cit = Citation(ref="[1]", source="file.pdf", page=3, score=0.9)
+        resp = RAGResponse(answer="answer", sources=[], query="q", citations=[cit])
+        assert len(resp.citations) == 1
+        assert resp.citations[0].page == 3

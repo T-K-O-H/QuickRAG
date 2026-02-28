@@ -1,6 +1,6 @@
 """QuickRAG - Fast, plug-and-play RAG framework built on LangGraph."""
 
-from quickrag.pipeline import RAGPipeline, RAGResponse
+from quickrag.pipeline import RAGPipeline, RAGResponse, Citation
 from quickrag.stores.qdrant import QdrantStore
 from quickrag.stores.base import Document, SearchResult
 from quickrag.embeddings.local import LocalEmbeddings
@@ -15,6 +15,7 @@ __version__ = "0.2.0"
 __all__ = [
     "RAGPipeline",
     "RAGResponse",
+    "Citation",
     "QdrantStore",
     "Document",
     "SearchResult",

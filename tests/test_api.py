@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-from quickrag.pipeline import RAGResponse
+from quickrag.pipeline import RAGResponse, Citation
 from quickrag.stores.base import Document, SearchResult
 
 
@@ -23,10 +23,14 @@ def _make_mock_pipeline():
 
     # aquery is async, needs AsyncMock
     pipeline.aquery = AsyncMock(
-        return_value=RAGResponse(answer="mocked answer", sources=[], query="q")
+        return_value=RAGResponse(
+            answer="mocked answer", sources=[], query="q", citations=[]
+        )
     )
     pipeline.query_conversational = MagicMock(
-        return_value=RAGResponse(answer="conversational answer", sources=[], query="q")
+        return_value=RAGResponse(
+            answer="conversational answer", sources=[], query="q", citations=[]
+        )
     )
 
     return pipeline
@@ -150,6 +154,25 @@ class TestQueryEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["answer"] == "mocked answer"
+        assert data["citations"] == []
+
+    def test_query_with_citations(self, client, mock_pipeline):
+        cit = Citation(ref="[1]", source="report.pdf", page=6, score=0.9,
+                       content_preview="Some content", document_id="d1")
+        mock_pipeline.aquery = AsyncMock(
+            return_value=RAGResponse(
+                answer="answer [1]", sources=[], query="q",
+                citations=[cit],
+            )
+        )
+
+        response = client.post("/api/query", json={"query": "test"})
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["citations"]) == 1
+        assert data["citations"][0]["ref"] == "[1]"
+        assert data["citations"][0]["source"] == "report.pdf"
+        assert data["citations"][0]["page"] == 6
 
     def test_query_with_collection(self, client, mock_pipeline):
         response = client.post(
