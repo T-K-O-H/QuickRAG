@@ -149,15 +149,18 @@ class QdrantStore(BaseStore):
         filter: dict[str, Any] | None = None,
         query_text: str | None = None,
         hybrid_weight: float = 0.7,
+        search_mode: str = "hybrid",
     ) -> list[SearchResult]:
-        """Search using hybrid (semantic + sparse) retrieval.
+        """Search using the specified retrieval mode.
 
         Args:
             query_embedding: Dense query embedding.
             top_k: Number of results.
             filter: Metadata filter.
-            query_text: Original query text for sparse search.
+            query_text: Original query text for sparse/keyword search.
             hybrid_weight: Weight for dense vs sparse (0-1, higher = more dense).
+            search_mode: "hybrid" (dense + sparse RRF), "dense" (semantic only),
+                or "keyword" (BM25 sparse only).
 
         Returns:
             List of search results.
@@ -174,8 +177,26 @@ class QdrantStore(BaseStore):
             ]
             qdrant_filter = models.Filter(must=conditions)
 
-        # Hybrid search with prefetch
-        if self.enable_hybrid and query_text:
+        # Keyword-only search (BM25 sparse vectors)
+        if search_mode == "keyword" and self.enable_hybrid and query_text:
+            sparse_indices, sparse_values = self._compute_sparse_vector(query_text)
+
+            query_kwargs = {
+                "collection_name": self.collection,
+                "query": models.SparseVector(
+                    indices=sparse_indices, values=sparse_values
+                ),
+                "using": "sparse",
+                "limit": top_k,
+                "with_payload": True,
+            }
+            if qdrant_filter:
+                query_kwargs["query_filter"] = qdrant_filter
+
+            results = self._client.query_points(**query_kwargs)
+
+        # Hybrid search with prefetch (default when hybrid is available)
+        elif search_mode == "hybrid" and self.enable_hybrid and query_text:
             sparse_indices, sparse_values = self._compute_sparse_vector(query_text)
 
             query_kwargs = {
@@ -203,7 +224,7 @@ class QdrantStore(BaseStore):
 
             results = self._client.query_points(**query_kwargs)
         else:
-            # Dense-only search
+            # Dense-only search (semantic embeddings)
             query_kwargs = {
                 "collection_name": self.collection,
                 "query": query_embedding,

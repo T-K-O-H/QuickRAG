@@ -13,8 +13,8 @@ from quickrag.llms.base import BaseLLM
 from quickrag.llms.ollama import OllamaLLM
 from quickrag.llms.openai import OpenAILLM
 from quickrag.loaders.auto import load as auto_load
-from quickrag.chunkers.text import RecursiveChunker
-from quickrag.config import settings
+from quickrag.chunkers.text import RecursiveChunker, TextChunker
+from quickrag.config import settings, FeatureToggles
 from quickrag.logging import get_logger
 
 logger = get_logger(__name__)
@@ -66,6 +66,7 @@ class RAGPipeline:
         chunk_overlap: int | None = None,
         top_k: int | None = None,
         use_graph: bool = False,
+        toggles: FeatureToggles | None = None,
     ):
         """Initialize RAG pipeline.
 
@@ -77,17 +78,36 @@ class RAGPipeline:
             chunk_overlap: Overlap between chunks.
             top_k: Number of documents to retrieve.
             use_graph: Whether to use LangGraph workflow for queries.
+            toggles: Feature toggles for search mode, citations, debug, etc.
         """
+        self.toggles = toggles or FeatureToggles.from_settings()
         self.embeddings = embeddings or LocalEmbeddings()
         self.store = store or QdrantStore(embedding_dim=self.embeddings.dimension)
         self.llm = llm or OllamaLLM()
         self.top_k = top_k or settings.retrieval_top_k
         self.use_graph = use_graph
 
-        self.chunker = RecursiveChunker(
-            chunk_size=chunk_size or settings.chunk_size,
-            chunk_overlap=chunk_overlap or settings.chunk_overlap,
-        )
+        # Apply debug toggle to logging
+        if self.toggles.debug:
+            import logging
+
+            logging.getLogger("quickrag").setLevel(logging.DEBUG)
+            for handler in logging.getLogger("quickrag").handlers:
+                handler.setLevel(logging.DEBUG)
+
+        # Select chunker based on toggle
+        _chunk_size = chunk_size or settings.chunk_size
+        _chunk_overlap = chunk_overlap or settings.chunk_overlap
+        if self.toggles.chunking_strategy == "fixed":
+            self.chunker = TextChunker(
+                chunk_size=_chunk_size,
+                chunk_overlap=_chunk_overlap,
+            )
+        else:
+            self.chunker = RecursiveChunker(
+                chunk_size=_chunk_size,
+                chunk_overlap=_chunk_overlap,
+            )
 
         # Custom hooks (set via decorators)
         self._custom_chunker: Callable | None = None
@@ -114,7 +134,13 @@ Context:
 
 Answer the question accurately and concisely based on the context above, citing sources with [n] markers."""
 
-        logger.info("Pipeline initialized (graph=%s)", use_graph)
+        logger.info(
+            "Pipeline initialized (graph=%s, search=%s, citations=%s, chunking=%s)",
+            use_graph,
+            self.toggles.search_mode,
+            self.toggles.citations,
+            self.toggles.chunking_strategy,
+        )
 
     # ------------------------------------------------------------------
     # Factory methods
@@ -127,6 +153,7 @@ Answer the question accurately and concisely based on the context above, citing 
         embedding_model: str = "bge-small-en-v1.5",
         llm_model: str = "llama3.2",
         use_graph: bool = False,
+        toggles: FeatureToggles | None = None,
     ) -> "RAGPipeline":
         """Create a fully local pipeline.
 
@@ -138,6 +165,7 @@ Answer the question accurately and concisely based on the context above, citing 
             embedding_model: Local embedding model name.
             llm_model: Ollama model name.
             use_graph: Whether to use LangGraph workflow.
+            toggles: Feature toggles for search mode, citations, etc.
 
         Returns:
             Configured RAGPipeline.
@@ -151,6 +179,7 @@ Answer the question accurately and concisely based on the context above, citing 
             embeddings=embeddings,
             llm=OllamaLLM(llm_model),
             use_graph=use_graph,
+            toggles=toggles,
         )
 
     @classmethod
@@ -161,6 +190,7 @@ Answer the question accurately and concisely based on the context above, citing 
         llm_model: str = "gpt-4o-mini",
         api_key: str | None = None,
         use_graph: bool = False,
+        toggles: FeatureToggles | None = None,
     ) -> "RAGPipeline":
         """Create a cloud-based pipeline using OpenAI.
 
@@ -172,6 +202,7 @@ Answer the question accurately and concisely based on the context above, citing 
             llm_model: OpenAI LLM model.
             api_key: OpenAI API key.
             use_graph: Whether to use LangGraph workflow.
+            toggles: Feature toggles for search mode, citations, etc.
 
         Returns:
             Configured RAGPipeline.
@@ -185,6 +216,7 @@ Answer the question accurately and concisely based on the context above, citing 
             embeddings=embeddings,
             llm=OpenAILLM(llm_model, api_key=api_key),
             use_graph=use_graph,
+            toggles=toggles,
         )
 
     @classmethod
@@ -195,6 +227,7 @@ Answer the question accurately and concisely based on the context above, citing 
         llm_model: str = "gpt-4o-mini",
         api_key: str | None = None,
         use_graph: bool = False,
+        toggles: FeatureToggles | None = None,
     ) -> "RAGPipeline":
         """Create a hybrid pipeline (local embeddings + cloud LLM).
 
@@ -206,6 +239,7 @@ Answer the question accurately and concisely based on the context above, citing 
             llm_model: OpenAI LLM model.
             api_key: OpenAI API key.
             use_graph: Whether to use LangGraph workflow.
+            toggles: Feature toggles for search mode, citations, etc.
 
         Returns:
             Configured RAGPipeline.
@@ -219,6 +253,7 @@ Answer the question accurately and concisely based on the context above, citing 
             embeddings=embeddings,
             llm=OpenAILLM(llm_model, api_key=api_key),
             use_graph=use_graph,
+            toggles=toggles,
         )
 
     # ------------------------------------------------------------------
@@ -352,8 +387,15 @@ Answer the question accurately and concisely based on the context above, citing 
     # Retrieval helpers
     # ------------------------------------------------------------------
 
-    def _retrieve(self, query: str, filter: dict[str, Any] | None = None) -> list[SearchResult]:
+    def _retrieve(
+        self,
+        query: str,
+        filter: dict[str, Any] | None = None,
+        toggles: FeatureToggles | None = None,
+    ) -> list[SearchResult]:
         """Retrieve relevant documents for a query."""
+        active = toggles or self.toggles
+
         if self._custom_retriever:
             return self._custom_retriever(query, self.top_k)
 
@@ -364,7 +406,20 @@ Answer the question accurately and concisely based on the context above, citing 
             top_k=self.top_k,
             query_text=query,
             filter=filter,
+            search_mode=active.search_mode,
         )
+
+        # Apply score threshold filtering
+        if active.score_threshold > 0:
+            results = [r for r in results if r.score >= active.score_threshold]
+
+        if active.debug:
+            logger.debug(
+                "Retrieved %d results (mode=%s, threshold=%.2f)",
+                len(results),
+                active.search_mode,
+                active.score_threshold,
+            )
 
         return results
 
@@ -443,8 +498,14 @@ Answer the question accurately and concisely based on the context above, citing 
             )
         return citations
 
-    def _route(self, query: str) -> str:
+    def _route(self, query: str, toggles: FeatureToggles | None = None) -> str:
         """Route the query to appropriate handler."""
+        active = toggles or self.toggles
+
+        # When routing is disabled, always go through retrieval
+        if not active.routing:
+            return "retrieval"
+
         if self._custom_router:
             return self._custom_router(query)
 
@@ -458,6 +519,7 @@ Answer the question accurately and concisely based on the context above, citing 
         self,
         query: str,
         filter: dict[str, Any] | None = None,
+        toggles: FeatureToggles | None = None,
     ) -> RAGResponse:
         """Query the RAG pipeline.
 
@@ -467,14 +529,17 @@ Answer the question accurately and concisely based on the context above, citing 
         Args:
             query: User question.
             filter: Optional metadata filter for retrieval.
+            toggles: Per-query feature toggle overrides.
 
         Returns:
             RAGResponse with answer and sources.
         """
+        active = toggles or self.toggles
+
         if self.use_graph:
             return self._query_via_graph(query)
 
-        route = self._route(query)
+        route = self._route(query, active)
 
         if route == "direct":
             response = self.llm.generate(query)
@@ -486,9 +551,9 @@ Answer the question accurately and concisely based on the context above, citing 
                 metadata={"route": "direct"},
             )
 
-        results = self._retrieve(query, filter=filter)
+        results = self._retrieve(query, filter=filter, toggles=active)
         context = self._build_context(results)
-        citations = self._build_citations(results)
+        citations = self._build_citations(results) if active.citations else []
 
         if self._custom_generator:
             answer = self._custom_generator(query, context)
@@ -502,7 +567,11 @@ Answer the question accurately and concisely based on the context above, citing 
             sources=results,
             query=query,
             citations=citations,
-            metadata={"route": route, "num_sources": len(results)},
+            metadata={
+                "route": route,
+                "num_sources": len(results),
+                "search_mode": active.search_mode,
+            },
         )
 
     def _query_via_graph(self, query: str) -> RAGResponse:
@@ -531,17 +600,21 @@ Answer the question accurately and concisely based on the context above, citing 
         self,
         query: str,
         filter: dict[str, Any] | None = None,
+        toggles: FeatureToggles | None = None,
     ) -> RAGResponse:
         """Async query the RAG pipeline.
 
         Args:
             query: User question.
             filter: Optional metadata filter for retrieval.
+            toggles: Per-query feature toggle overrides.
 
         Returns:
             RAGResponse with answer and sources.
         """
-        route = self._route(query)
+        active = toggles or self.toggles
+
+        route = self._route(query, active)
 
         if route == "direct":
             response = await self.llm.agenerate(query)
@@ -553,9 +626,9 @@ Answer the question accurately and concisely based on the context above, citing 
                 metadata={"route": "direct"},
             )
 
-        results = self._retrieve(query, filter=filter)
+        results = self._retrieve(query, filter=filter, toggles=active)
         context = self._build_context(results)
-        citations = self._build_citations(results)
+        citations = self._build_citations(results) if active.citations else []
 
         if self._custom_generator:
             answer = self._custom_generator(query, context)
@@ -569,31 +642,39 @@ Answer the question accurately and concisely based on the context above, citing 
             sources=results,
             query=query,
             citations=citations,
-            metadata={"route": route, "num_sources": len(results)},
+            metadata={
+                "route": route,
+                "num_sources": len(results),
+                "search_mode": active.search_mode,
+            },
         )
 
     async def astream(
         self,
         query: str,
         filter: dict[str, Any] | None = None,
+        toggles: FeatureToggles | None = None,
     ) -> AsyncIterator[str]:
         """Stream a response from the RAG pipeline.
 
         Args:
             query: User question.
             filter: Optional metadata filter for retrieval.
+            toggles: Per-query feature toggle overrides.
 
         Yields:
             Response chunks as strings.
         """
-        route = self._route(query)
+        active = toggles or self.toggles
+
+        route = self._route(query, active)
 
         if route == "direct":
             async for chunk in self.llm.astream(query):
                 yield chunk
             return
 
-        results = self._retrieve(query, filter=filter)
+        results = self._retrieve(query, filter=filter, toggles=active)
         context = self._build_context(results)
 
         prompt = self.system_prompt.format(context=context) + f"\n\nQuestion: {query}"

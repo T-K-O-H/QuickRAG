@@ -1,7 +1,7 @@
 """Query endpoints for QuickRAG API."""
 
 import json
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,11 +9,22 @@ from pydantic import BaseModel
 
 from api.auth import verify_api_key
 from api.dependencies import get_pipeline, get_pipeline_for_collection
+from quickrag.config import FeatureToggles
 from quickrag.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+class ToggleOverrides(BaseModel):
+    """Per-query feature toggle overrides."""
+
+    search_mode: Literal["hybrid", "dense", "keyword"] | None = None
+    citations: bool | None = None
+    debug: bool | None = None
+    score_threshold: float | None = None
+    routing: bool | None = None
 
 
 class QueryRequest(BaseModel):
@@ -25,6 +36,7 @@ class QueryRequest(BaseModel):
     collection: str | None = None
     filter: dict | None = None
     conversational: bool = False
+    toggles: ToggleOverrides | None = None
 
 
 class SourceDocument(BaseModel):
@@ -61,7 +73,8 @@ async def query(request: QueryRequest, _key: str | None = Depends(verify_api_key
     """Query the RAG pipeline.
 
     Returns an answer based on retrieved documents.  Supports optional
-    metadata filtering, per-collection targeting, and conversational mode.
+    metadata filtering, per-collection targeting, conversational mode,
+    and per-query feature toggle overrides.
     """
     pipeline = (
         get_pipeline_for_collection(request.collection)
@@ -72,11 +85,20 @@ async def query(request: QueryRequest, _key: str | None = Depends(verify_api_key
     if request.top_k:
         pipeline.top_k = request.top_k
 
+    # Build per-query toggles from overrides
+    query_toggles = None
+    if request.toggles:
+        query_toggles = pipeline.toggles.merge(
+            request.toggles.model_dump(exclude_none=True)
+        )
+
     try:
         if request.conversational:
             response = pipeline.query_conversational(request.query)
         else:
-            response = await pipeline.aquery(request.query, filter=request.filter)
+            response = await pipeline.aquery(
+                request.query, filter=request.filter, toggles=query_toggles
+            )
 
         sources = [
             SourceDocument(
@@ -126,9 +148,18 @@ async def query_stream(request: QueryRequest, _key: str | None = Depends(verify_
     if request.top_k:
         pipeline.top_k = request.top_k
 
+    # Build per-query toggles from overrides
+    query_toggles = None
+    if request.toggles:
+        query_toggles = pipeline.toggles.merge(
+            request.toggles.model_dump(exclude_none=True)
+        )
+
     async def generate() -> AsyncIterator[str]:
         try:
-            results = pipeline._retrieve(request.query, filter=request.filter)
+            results = pipeline._retrieve(
+                request.query, filter=request.filter, toggles=query_toggles
+            )
             sources = [
                 {
                     "content": s.document.content,
@@ -189,3 +220,25 @@ async def clear_history(
     )
     pipeline.clear_history()
     return {"success": True, "message": "Conversation history cleared"}
+
+
+@router.get("/toggles")
+async def get_toggles(
+    collection: str | None = None,
+    _key: str | None = Depends(verify_api_key),
+):
+    """Return the active feature toggles for the pipeline."""
+    pipeline = (
+        get_pipeline_for_collection(collection)
+        if collection
+        else get_pipeline()
+    )
+    t = pipeline.toggles
+    return {
+        "search_mode": t.search_mode,
+        "citations": t.citations,
+        "debug": t.debug,
+        "chunking_strategy": t.chunking_strategy,
+        "score_threshold": t.score_threshold,
+        "routing": t.routing,
+    }

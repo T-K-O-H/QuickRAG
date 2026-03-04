@@ -1,5 +1,6 @@
 """QuickRAG - Fast, plug-and-play RAG framework built on LangGraph."""
 
+from quickrag.config import FeatureToggles
 from quickrag.pipeline import RAGPipeline, RAGResponse, Citation
 from quickrag.stores.qdrant import QdrantStore
 from quickrag.stores.base import Document, SearchResult
@@ -13,6 +14,7 @@ from quickrag.loaders.docx_loader import DocxLoader
 
 __version__ = "0.2.0"
 __all__ = [
+    "FeatureToggles",
     "RAGPipeline",
     "RAGResponse",
     "Citation",
